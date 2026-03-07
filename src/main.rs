@@ -2,9 +2,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Queries MTR (Hong Kong subway) point-to-point journey times.")]
@@ -17,7 +15,7 @@ struct Args {
     #[arg(value_name = "TO")]
     to: Option<String>,
 
-    /// Re-scrapes piliapp and updates cache
+    /// Re-scrapes official MTR API and updates cache
     #[arg(long)]
     refresh: bool,
 
@@ -35,7 +33,7 @@ struct Cache {
     network: Vec<(String, Vec<String>)>,
 }
 
-fn fetch_mtr_network() -> Result<Vec<(String, Vec<String>)>, String> {
+fn fetch_mtr_data() -> Result<(Vec<(String, Vec<String>)>, HashMap<String, u32>), String> {
     let url = "https://opendata.mtr.com.hk/data/mtr_lines_and_stations.csv";
     let resp = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
     let mut text = resp.text().map_err(|e| e.to_string())?;
@@ -46,18 +44,23 @@ fn fetch_mtr_network() -> Result<Vec<(String, Vec<String>)>, String> {
 
     let mut rdr = csv::Reader::from_reader(text.as_bytes());
     let mut line_map: HashMap<String, Vec<(f32, String)>> = HashMap::new();
+    let mut id_map: HashMap<String, u32> = HashMap::new();
 
     for result in rdr.records() {
         let record = result.map_err(|e| e.to_string())?;
         if record.len() < 7 { continue; }
         let line_code = &record[0];
         let direction = &record[1];
+        let station_id_str = &record[2];
         let english_name = &record[5];
         let sequence_str = &record[6];
 
         if direction != "DT" {
             continue;
         }
+
+        let station_id: u32 = station_id_str.parse().unwrap_or(0);
+        id_map.insert(english_name.to_string(), station_id);
 
         let sequence: f32 = sequence_str.parse().unwrap_or(0.0);
         line_map
@@ -88,125 +91,62 @@ fn fetch_mtr_network() -> Result<Vec<(String, Vec<String>)>, String> {
         }
     }
 
-    Ok(network)
-}
-
-fn mtr_network() -> Vec<(String, Vec<String>)> {
-    match fetch_mtr_network() {
-        Ok(network) => network,
-        Err(e) => {
-            eprintln!("Warning: could not fetch official MTR network data: {}", e);
-            vec![]
-        }
-    }
+    Ok((network, id_map))
 }
 
 fn get_cache_path() -> PathBuf {
-    let mut path = home::home_dir().expect("Could not find home directory");
+    let home_dir = std::env::var("HOME").expect("HOME environment variable not set");
+    let mut path = PathBuf::from(home_dir);
     path.push(".local/share/poros/cache.json");
     path
 }
 
-fn check_agent_browser() -> Result<(), String> {
-    Command::new("agent-browser")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|_| "agent-browser not found — install it first".to_string())?;
-    Ok(())
-}
-
-fn run_agent_command(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("agent-browser")
-        .args(args)
-        .output()
-        .map_err(|e| format!("Failed to run agent-browser: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "agent-browser failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn scrape() -> Result<Cache, String> {
-    check_agent_browser()?;
-
-    println!("Scraping piliapp.com (takes ~5 min)...");
-    
-    run_agent_command(&["open", "https://www.piliapp.com/hongkong-mtr/"])?;
-    
-    // Switch to Journey Time mode
-    run_agent_command(&[
-        "eval",
-        "document.querySelectorAll('option')[0].selected=true; document.querySelectorAll('select')[0].dispatchEvent(new Event('change',{bubbles:true})); 'ok'"
-    ])?;
-
+fn scrape(id_map: &HashMap<String, u32>) -> Result<Cache, String> {
     let mut cache = Cache::default();
-    let mut station_names = Vec::new();
+    let mut station_names: Vec<String> = id_map.keys().cloned().collect();
+    station_names.sort();
+    cache.stations = station_names.clone();
 
-    for i in 1..=120 {
-        let id = format!("t{}", i);
-        let click_res = run_agent_command(&[
-            "eval",
-            &format!("var el=document.getElementById('{}'); if(el) {{ el.click(); 'ok' }} else 'skip'", id)
-        ])?;
+    let total_stations = station_names.len();
+    println!("Scraping journey times for {} unique stations (DT direction)...", total_stations);
 
-        if click_res.contains("skip") {
-            continue;
+    for (i, from_name) in station_names.iter().enumerate() {
+        if i % 10 == 0 {
+            println!("Progress: {}/{} stations processed...", i, total_stations);
         }
 
-        print!("\rProgress: station {}/120...", i);
-        io::stdout().flush().unwrap();
+        let from_id = id_map.get(from_name).unwrap();
+        let mut row = HashMap::new();
 
-        run_agent_command(&["wait", "300"])?;
+        for to_name in &station_names {
+            if from_name == to_name {
+                row.insert(to_name.clone(), 0);
+                continue;
+            }
 
-        let times_json = run_agent_command(&[
-            "eval",
-            "var r={}; document.querySelectorAll('span[id^=\"t\"]').forEach(function(s){ var name=s.textContent.trim(); var sib=s.nextSibling; var t=sib?sib.textContent.trim():''; if(t&&!isNaN(parseInt(t)))r[name]=parseInt(t); }); JSON.stringify(r)"
-        ])?;
+            let to_id = id_map.get(to_name).unwrap();
+            let url = format!("https://www.mtr.com.hk/share/customer/jp/api/HRRoutes/?o={}&d={}", from_id, to_id);
+            
+            // Be polite: 500ms sleep
+            std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // Handle possible quotes around the JSON string from agent-browser eval
-        let times_json_clean = if (times_json.starts_with('"') && times_json.ends_with('"')) || (times_json.starts_with('\'') && times_json.ends_with('\'')) {
-            &times_json[1..times_json.len()-1]
-        } else {
-            &times_json
-        };
-        
-        // agent-browser might escape quotes in the JSON string
-        let times_json_unescaped = times_json_clean.replace("\\\"", "\"");
+            let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
+            let data: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
 
-        let times: HashMap<String, u32> = serde_json::from_str(&times_json_unescaped)
-            .map_err(|e| format!("Failed to parse times JSON for {}: {}. JSON: {}", id, e, times_json_unescaped))?;
-
-        let active_name = run_agent_command(&[
-            "eval",
-            &format!("document.getElementById('{}').textContent.trim()", id)
-        ])?;
-        
-        let active_name = if (active_name.starts_with('"') && active_name.ends_with('"')) || (active_name.starts_with('\'') && active_name.ends_with('\'')) {
-            active_name[1..active_name.len()-1].to_string()
-        } else {
-            active_name
-        };
-
-        if !station_names.contains(&active_name) {
-            station_names.push(active_name.clone());
+            if data["errorCode"] == "0" {
+                if let Some(routes) = data["routes"].as_array() {
+                    if !routes.is_empty() {
+                        if let Some(time) = routes[0]["time"].as_u64() {
+                            row.insert(to_name.clone(), time as u32);
+                        }
+                    }
+                }
+            }
         }
-
-        cache.matrix.insert(active_name, times);
+        cache.matrix.insert(from_name.clone(), row);
     }
 
     println!("\nScraping complete.");
-    run_agent_command(&["close"])?;
-
-    station_names.sort();
-    cache.stations = station_names;
-
     Ok(cache)
 }
 
@@ -271,39 +211,6 @@ fn normalize(s: &str) -> String {
 }
 
 fn find_route(from: &str, to: &str, cache_stations: &[String], network: &[(String, Vec<String>)]) -> String {
-    let mut norm_to_canonical = HashMap::new();
-    for s in cache_stations {
-        norm_to_canonical.insert(normalize(s), s.clone());
-    }
-
-    let mut graph: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (line_name, stations) in network {
-        for i in 0..stations.len() {
-            let s1_norm = normalize(&stations[i]);
-            let s1 = if let Some(s) = norm_to_canonical.get(&s1_norm) { s.clone() } else { continue };
-            if i > 0 {
-                let s2_norm = normalize(&stations[i - 1]);
-                if let Some(s2) = norm_to_canonical.get(&s2_norm) {
-                    graph.entry(s1.clone()).or_default().push((s2.clone(), line_name.clone()));
-                    graph.entry(s2.clone()).or_default().push((s1.clone(), line_name.clone()));
-                }
-            }
-        }
-    }
-
-    let mut queue = VecDeque::new();
-    let from_norm = normalize(from);
-    let from_canonical = norm_to_canonical.get(&from_norm).cloned().unwrap_or_else(|| from.to_string());
-
-    let mut visited = HashMap::new(); // (station, line) -> transfers
-
-    for (line_name, stations) in network {
-        if stations.iter().any(|s| normalize(s) == from_norm) {
-            let state = (from_canonical.clone(), line_name.clone());
-            queue.push_back((from_canonical.clone(), line_name.clone(), 0, vec![state.clone()]));
-            visited.insert(state, 0);
-        }
-    }
     let mut norm_to_canonical = HashMap::new();
     for s in cache_stations {
         norm_to_canonical.insert(normalize(s), s.clone());
@@ -414,9 +321,11 @@ fn main() {
     let cache_res = load_cache();
     
     let cache = if args.refresh {
-        match scrape() {
+        println!("Refreshing cache from official MTR API...");
+        let (network, id_map) = fetch_mtr_data().expect("Failed to fetch MTR data");
+        match scrape(&id_map) {
             Ok(mut new_cache) => {
-                new_cache.network = mtr_network();
+                new_cache.network = network;
                 save_cache(&new_cache).expect("Failed to save cache");
                 new_cache
             }
@@ -429,7 +338,8 @@ fn main() {
         match cache_res {
             Ok(mut c) => {
                 if c.network.is_empty() {
-                    c.network = mtr_network();
+                    let (network, _) = fetch_mtr_data().expect("Failed to fetch MTR data");
+                    c.network = network;
                     if !c.network.is_empty() {
                         save_cache(&c).expect("Failed to save cache");
                     }
@@ -437,10 +347,11 @@ fn main() {
                 c
             }
             Err(_) => {
-                println!("Cache empty, scraping piliapp.com (takes ~5 min)...");
-                match scrape() {
+                println!("Cache empty, refreshing from official MTR API...");
+                let (network, id_map) = fetch_mtr_data().expect("Failed to fetch MTR data");
+                match scrape(&id_map) {
                     Ok(mut new_cache) => {
-                        new_cache.network = mtr_network();
+                        new_cache.network = network;
                         save_cache(&new_cache).expect("Failed to save cache");
                         new_cache
                     }
