@@ -31,6 +31,74 @@ struct Cache {
     stations: Vec<String>,
     // matrix[from_station][to_station] = minutes
     matrix: HashMap<String, HashMap<String, u32>>,
+    #[serde(default)]
+    network: Vec<(String, Vec<String>)>,
+}
+
+fn fetch_mtr_network() -> Result<Vec<(String, Vec<String>)>, String> {
+    let url = "https://opendata.mtr.com.hk/data/mtr_lines_and_stations.csv";
+    let resp = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
+    let mut text = resp.text().map_err(|e| e.to_string())?;
+
+    if text.starts_with('\u{feff}') {
+        text.remove(0);
+    }
+
+    let mut rdr = csv::Reader::from_reader(text.as_bytes());
+    let mut line_map: HashMap<String, Vec<(f32, String)>> = HashMap::new();
+
+    for result in rdr.records() {
+        let record = result.map_err(|e| e.to_string())?;
+        if record.len() < 7 { continue; }
+        let line_code = &record[0];
+        let direction = &record[1];
+        let english_name = &record[5];
+        let sequence_str = &record[6];
+
+        if direction != "DT" {
+            continue;
+        }
+
+        let sequence: f32 = sequence_str.parse().unwrap_or(0.0);
+        line_map
+            .entry(line_code.to_string())
+            .or_default()
+            .push((sequence, english_name.to_string()));
+    }
+
+    let mut network = Vec::new();
+    let display_names = vec![
+        ("AEL", "Airport Express"),
+        ("DRL", "Disneyland Resort"),
+        ("EAL", "East Rail"),
+        ("ISL", "Island"),
+        ("KTL", "Kwun Tong"),
+        ("SIL", "South Island"),
+        ("TCL", "Tung Chung"),
+        ("TKL", "Tseung Kwan O"),
+        ("TML", "Tuen Ma"),
+        ("TWL", "Tsuen Wan"),
+    ];
+
+    for (code, display) in display_names {
+        if let Some(mut stations) = line_map.remove(code) {
+            stations.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let names: Vec<String> = stations.into_iter().map(|(_, name)| name).collect();
+            network.push((display.to_string(), names));
+        }
+    }
+
+    Ok(network)
+}
+
+fn mtr_network() -> Vec<(String, Vec<String>)> {
+    match fetch_mtr_network() {
+        Ok(network) => network,
+        Err(e) => {
+            eprintln!("Warning: could not fetch official MTR network data: {}", e);
+            vec![]
+        }
+    }
 }
 
 fn get_cache_path() -> PathBuf {
@@ -202,53 +270,14 @@ fn normalize(s: &str) -> String {
     s.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-fn mtr_network() -> Vec<(String, Vec<String>)> {
-    vec![
-        ("Island Line".to_string(), vec![
-            "Kennedy Town".to_string(), "HKU".to_string(), "Sai Ying Pun".to_string(), "Sheung Wan".to_string(), "Central".to_string(), "Admiralty".to_string(), "Wan Chai".to_string(), "Causeway Bay".to_string(), "Tin Hau".to_string(), "Fortress Hill".to_string(), "North Point".to_string(), "Quarry Bay".to_string(), "Tai Koo".to_string(), "Sai Wan Ho".to_string(), "Shau Kei Wan".to_string(), "Heng Fa Chuen".to_string(), "Chai Wan".to_string()
-        ]),
-        ("Tsuen Wan Line".to_string(), vec![
-            "Central".to_string(), "Admiralty".to_string(), "Tsim Sha Tsui".to_string(), "Jordan".to_string(), "Yau Ma Tei".to_string(), "Mong Kok".to_string(), "Prince Edward".to_string(), "Sham Shui Po".to_string(), "Cheung Sha Wan".to_string(), "Lai Chi Kok".to_string(), "Mei Foo".to_string(), "Lai King".to_string(), "Kwai Fong".to_string(), "Kwai Hing".to_string(), "Tai Wo Hau".to_string(), "Tsuen Wan".to_string()
-        ]),
-        ("Kwun Tong Line".to_string(), vec![
-            "Whampoa".to_string(), "Ho Man Tin".to_string(), "Yau Ma Tei".to_string(), "Mong Kok".to_string(), "Prince Edward".to_string(), "Shek Kip Mei".to_string(), "Kowloon Tong".to_string(), "Lok Fu".to_string(), "Wong Tai Sin".to_string(), "Diamond Hill".to_string(), "Choi Hung".to_string(), "Kowloon Bay".to_string(), "Ngau Tau Kok".to_string(), "Kwun Tong".to_string(), "Lam Tin".to_string(), "Yau Tong".to_string(), "Tiu Keng Leng".to_string()
-        ]),
-        ("Tuen Ma Line".to_string(), vec![
-            "Tuen Mun".to_string(), "Siu Hong".to_string(), "Tin Shui Wai".to_string(), "Long Ping".to_string(), "Yuen Long".to_string(), "Kam Sheung Road".to_string(), "Tsuen Wan West".to_string(), "Mei Foo".to_string(), "Nam Cheong".to_string(), "Austin".to_string(), "East Tsim Sha Tsui".to_string(), "Hung Hom".to_string(), "Ho Man Tin".to_string(), "To Kwa Wan".to_string(), "Sung Wong Toi".to_string(), "Kai Tak".to_string(), "Diamond Hill".to_string(), "Hin Keng".to_string(), "Tai Wai".to_string(), "Che Kung Temple".to_string(), "Sha Tin Wai".to_string(), "City One".to_string(), "Shek Mun".to_string(), "Tai Shui Hang".to_string(), "Heng On".to_string(), "Ma On shan".to_string(), "Wu Kai Sha".to_string()
-        ]),
-        ("East Rail Line".to_string(), vec![
-            "Admiralty".to_string(), "Exhibition Centre".to_string(), "Hung Hom".to_string(), "Mong Kok East".to_string(), "Kowloon Tong".to_string(), "Tai Wai".to_string(), "Sha Tin".to_string(), "Fo Tan".to_string(), "University".to_string(), "Tai Po Market".to_string(), "Tai Wo".to_string(), "Fanling".to_string(), "Sheung Shui".to_string(), "Lo Wu".to_string()
-        ]),
-        ("East Rail Line (Lok Ma Chau)".to_string(), vec!["Sheung Shui".to_string(), "Lok Ma Chau".to_string()]),
-        ("East Rail Line (Racecourse)".to_string(), vec!["Tai Wai".to_string(), "Racecourse".to_string(), "University".to_string()]),
-        ("Tung Chung Line".to_string(), vec![
-            "Hong Kong".to_string(), "Kowloon".to_string(), "Olympic".to_string(), "Nam Cheong".to_string(), "Lai King".to_string(), "Tsing Yi".to_string(), "Sunny Bay".to_string(), "Tung Chung".to_string()
-        ]),
-        ("Tseung Kwan O Line".to_string(), vec![
-            "North Point".to_string(), "Quarry Bay".to_string(), "Yau Tong".to_string(), "Tiu Keng Leng".to_string(), "Tseung Kwan O".to_string(), "Hang Hau".to_string(), "Po Lam".to_string()
-        ]),
-        ("Tseung Kwan O Line (Lohas Park)".to_string(), vec!["Tseung Kwan O".to_string(), "Lohas Park".to_string()]),
-        ("South Island Line".to_string(), vec![
-            "Admiralty".to_string(), "Ocean Park".to_string(), "Wong Chuk Hang".to_string(), "Lei Tung".to_string(), "South Horizons".to_string()
-        ]),
-        ("Disneyland Resort Line".to_string(), vec![
-            "Sunny Bay".to_string(), "Disneyland Resort".to_string()
-        ]),
-        ("Airport Express".to_string(), vec![
-            "Hong Kong".to_string(), "Kowloon".to_string(), "Tsing Yi".to_string(), "Airport".to_string(), "AsiaWorld-Expo".to_string()
-        ]),
-    ]
-}
-
-fn find_route(from: &str, to: &str, cache_stations: &[String]) -> String {
-    let network = mtr_network();
+fn find_route(from: &str, to: &str, cache_stations: &[String], network: &[(String, Vec<String>)]) -> String {
     let mut norm_to_canonical = HashMap::new();
     for s in cache_stations {
         norm_to_canonical.insert(normalize(s), s.clone());
     }
 
     let mut graph: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (line_name, stations) in &network {
+    for (line_name, stations) in network {
         for i in 0..stations.len() {
             let s1_norm = normalize(&stations[i]);
             let s1 = if let Some(s) = norm_to_canonical.get(&s1_norm) { s.clone() } else { continue };
@@ -268,7 +297,40 @@ fn find_route(from: &str, to: &str, cache_stations: &[String]) -> String {
 
     let mut visited = HashMap::new(); // (station, line) -> transfers
 
-    for (line_name, stations) in &network {
+    for (line_name, stations) in network {
+        if stations.iter().any(|s| normalize(s) == from_norm) {
+            let state = (from_canonical.clone(), line_name.clone());
+            queue.push_back((from_canonical.clone(), line_name.clone(), 0, vec![state.clone()]));
+            visited.insert(state, 0);
+        }
+    }
+    let mut norm_to_canonical = HashMap::new();
+    for s in cache_stations {
+        norm_to_canonical.insert(normalize(s), s.clone());
+    }
+
+    let mut graph: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (line_name, stations) in network {
+        for i in 0..stations.len() {
+            let s1_norm = normalize(&stations[i]);
+            let s1 = if let Some(s) = norm_to_canonical.get(&s1_norm) { s.clone() } else { continue };
+            if i > 0 {
+                let s2_norm = normalize(&stations[i - 1]);
+                if let Some(s2) = norm_to_canonical.get(&s2_norm) {
+                    graph.entry(s1.clone()).or_default().push((s2.clone(), line_name.clone()));
+                    graph.entry(s2.clone()).or_default().push((s1.clone(), line_name.clone()));
+                }
+            }
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    let from_norm = normalize(from);
+    let from_canonical = norm_to_canonical.get(&from_norm).cloned().unwrap_or_else(|| from.to_string());
+
+    let mut visited = HashMap::new(); // (station, line) -> transfers
+
+    for (line_name, stations) in network {
         if stations.iter().any(|s| normalize(s) == from_norm) {
             let state = (from_canonical.clone(), line_name.clone());
             queue.push_back((from_canonical.clone(), line_name.clone(), 0, vec![state.clone()]));
@@ -306,7 +368,7 @@ fn find_route(from: &str, to: &str, cache_stations: &[String]) -> String {
         }
 
         // 1-transfer: change line
-        for (line_name, stations) in &network {
+        for (line_name, stations) in network {
             if line_name != &curr_line && stations.iter().any(|s| normalize(s) == normalize(&curr_station)) {
                 let next_transfers = transfers + 1;
                 let next_state = (curr_station.clone(), line_name.clone());
@@ -353,7 +415,8 @@ fn main() {
     
     let cache = if args.refresh {
         match scrape() {
-            Ok(new_cache) => {
+            Ok(mut new_cache) => {
+                new_cache.network = mtr_network();
                 save_cache(&new_cache).expect("Failed to save cache");
                 new_cache
             }
@@ -364,11 +427,20 @@ fn main() {
         }
     } else {
         match cache_res {
-            Ok(c) => c,
+            Ok(mut c) => {
+                if c.network.is_empty() {
+                    c.network = mtr_network();
+                    if !c.network.is_empty() {
+                        save_cache(&c).expect("Failed to save cache");
+                    }
+                }
+                c
+            }
             Err(_) => {
                 println!("Cache empty, scraping piliapp.com (takes ~5 min)...");
                 match scrape() {
-                    Ok(new_cache) => {
+                    Ok(mut new_cache) => {
+                        new_cache.network = mtr_network();
                         save_cache(&new_cache).expect("Failed to save cache");
                         new_cache
                     }
@@ -421,7 +493,7 @@ fn main() {
         if let Some(row) = cache.matrix.get(from_station) {
             if let Some(time) = row.get(to_station) {
                 println!("{} min", time);
-                let route = find_route(from_station, to_station, &cache.stations);
+                let route = find_route(from_station, to_station, &cache.stations, &cache.network);
                 println!("Route: {}", route);
             } else {
                 eprintln!("No journey time found between {} and {}", from_station, to_station);
